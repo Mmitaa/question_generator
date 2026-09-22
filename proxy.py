@@ -1150,7 +1150,14 @@ class Cluster:
                         instance.awake_gb = freed + instance.tail
                         self.footprints[instance.spec.name] = instance.awake_gb
                 elif 0 <= instance.awake_gb - freed <= 0.5 * instance.awake_gb:
-                    instance.tail_gb = self.tails[instance.spec.name] = instance.awake_gb - freed
+                    measured = instance.awake_gb - freed
+                    if (instance.spec.name not in self.tails
+                            and abs(measured - self.settings.asleep_tail_gb) > 0.3):
+                        log.warning("%s во сне держит %.1f ГБ, а asleep_tail_gb в конфиге %.1f. "
+                                    "Дальше считаю по замеру, но размещение при старте прокси "
+                                    "решается по конфигу — поправьте его",
+                                    instance.label, measured, self.settings.asleep_tail_gb)
+                    instance.tail_gb = self.tails[instance.spec.name] = measured
                 return True
             except (httpx.HTTPError, RuntimeError, ValueError) as error:
                 instance.can_sleep = False
@@ -1266,10 +1273,46 @@ class Cluster:
 
     # ── обучение ───────────────────────────────────────────────────────────
 
-    async def start_training(self, gpus: list[int] | None, owner: str, pid: int | None) -> Lease:
-        """Отдаёт карты под обучение. Сразу закрывает на них вход моделям, даёт текущим запросам доработать не дольше drain_timeout, гасит модели и возвращает аренду."""
+    def usable_gb(self, gpu: Gpu) -> float:
+        """Сколько памяти карты достанется обучению, когда прокси уберёт с неё свои модели. Чужие процессы никуда не денутся, резерв оставляем на фрагментацию."""
+        return max(0.0, gpu.memory.total_gb - gpu.foreign_gb() - self.settings.reserve_gb)
+
+    def pick_gpus(self, vram_gb: float) -> list[int]:
+        """Набирает карты под обучение, которому нужно vram_gb ГБ. Берёт те, что меньше всего мешают моделям: сначала без приоритетных, потом где меньше активных копий, потом те, что просторнее. Карты одинакового объёма так же дают и наименьшее их число."""
+        free_choice = sorted((gpu for gpu in self.gpus.values() if not gpu.blocked),
+                             key=lambda g: (any(i.spec.priority for i in g.instances),
+                                            sum(i.state is State.AWAKE for i in g.instances),
+                                            -self.usable_gb(g)))
+        chosen: list[int] = []
+        total = 0.0
+        for gpu in free_choice:
+            if total >= vram_gb:
+                break
+            chosen.append(gpu.id)
+            total += self.usable_gb(gpu)
+        if total < vram_gb:
+            raise ValueError(f"обучению нужно {vram_gb:.1f} ГБ, а свободные карты дают "
+                             f"{total:.1f} ГБ ({len(free_choice)} шт). Уменьшите запрос "
+                             f"или дождитесь конца другого обучения")
+        return sorted(chosen)
+
+    async def start_training(self, gpus: list[int] | None, owner: str, pid: int | None,
+                             vram_gb: float | None = None) -> Lease:
+        """Отдаёт карты под обучение. Карты можно назвать списком, попросить по объёму через vram_gb или не указывать ничего и забрать все. Сразу закрывает на них вход моделям, даёт текущим запросам доработать не дольше drain_timeout, гасит модели и возвращает аренду."""
         await self.refresh()
-        targets = set(self.gpus) if not gpus else set(gpus)
+        if vram_gb is not None:
+            if gpus is not None:
+                raise ValueError("укажите либо gpus, либо vram_gb, но не оба сразу")
+            if vram_gb <= 0:
+                raise ValueError("vram_gb должно быть больше нуля")
+            targets = set(self.pick_gpus(vram_gb))
+        elif gpus is None:
+            targets = set(self.gpus)          # ничего не просили — забираем всё
+        elif not gpus:
+            raise ValueError("gpus пуст: перечислите карты, попросите объём через vram_gb "
+                             "или уберите поле совсем, чтобы забрать все карты")
+        else:
+            targets = set(gpus)
         if unknown := targets - set(self.gpus):
             raise ValueError(f"карт {sorted(unknown)} нет, есть {sorted(self.gpus)}")
         stat = proc_stat(pid) if pid is not None else None
@@ -1491,16 +1534,24 @@ class Proxy:
             """Отдаёт карты под обучение. Отвечает, когда модели на них уже погашены."""
             raw = await request.body()
             body = await self.parse(raw) if raw.strip() else {}
-            gpus, pid = body.get("gpus"), body.get("pid")
+            if unknown := sorted(set(body) - {"gpus", "pid", "owner", "vram_gb"}):
+                raise HTTPException(400, f"непонятные поля {', '.join(unknown)}: "
+                                         f"допустимы gpus, vram_gb, pid, owner")
+            gpus, pid, need = body.get("gpus"), body.get("pid"), body.get("vram_gb")
             if gpus is not None and not (isinstance(gpus, list) and all(isinstance(g, int) for g in gpus)):
                 raise HTTPException(400, "gpus должен быть списком номеров карт или null")
             if pid is not None and not isinstance(pid, int):
                 raise HTTPException(400, "pid должен быть числом или null")
+            if need is not None and (isinstance(need, bool) or not isinstance(need, (int, float))):
+                raise HTTPException(400, "vram_gb должен быть числом ГБ или null")
             try:
-                lease = await self.cluster.start_training(gpus, str(body.get("owner") or "обучение"), pid)
+                lease = await self.cluster.start_training(
+                    gpus, str(body.get("owner") or "обучение"), pid, float(need) if need else None)
             except ValueError as error:
                 raise HTTPException(400, str(error))
-            return {**lease.describe(), "memory": [repr(self.cluster.gpus[g]) for g in sorted(lease.gpus)]}
+            got = sum(self.cluster.gpus[g].memory.free_gb for g in lease.gpus)
+            return {**lease.describe(), "free_gb": round(got, 1),
+                    "memory": [repr(self.cluster.gpus[g]) for g in sorted(lease.gpus)]}
 
         @app.delete("/admin/training/{lease_id}")
         async def end_training(lease_id: str):
