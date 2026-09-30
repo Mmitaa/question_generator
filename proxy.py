@@ -123,26 +123,19 @@ class Settings:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vllm_log_level", self.vllm_log_level.upper())
-        object.__setattr__(self, "_by_port", self._index_ports())
-        object.__setattr__(self, "_by_alias", self._index_aliases())
-        self._check_limits()
-
-    def _index_ports(self) -> dict[int, list[str]]:
         by_port: dict[int, list[str]] = {}
+        by_alias: dict[str, str] = {}
         for name, spec in self.models.items():
             if spec.port in self.internal_ports or spec.port == self.admin_port:
                 fail(f"{name}: внешний порт {spec.port} пересекается со служебными")
             by_port.setdefault(spec.port, []).append(name)
-        return by_port
-
-    def _index_aliases(self) -> dict[str, str]:
-        by_alias: dict[str, str] = {}
-        for name, spec in self.models.items():
             for alias in (name, *spec.aliases):
                 if alias in by_alias:
                     fail(f"имя {alias!r} занято двумя моделями: {by_alias[alias]} и {name}")
                 by_alias[alias] = name
-        return by_alias
+        object.__setattr__(self, "_by_port", by_port)
+        object.__setattr__(self, "_by_alias", by_alias)
+        self._check_limits()
 
     def _check_limits(self) -> None:
         broken = [message for bad, message in (
@@ -209,14 +202,6 @@ class Settings:
 
 
 # мелкие утилиты
-
-def strip_venv_from_path(path: str, virtual_env: str | None) -> str:
-    """иначе инстанс подхватит питон прокси вместо проектного"""
-    if not virtual_env:
-        return path
-    unwanted = str(Path(virtual_env) / "bin")
-    return os.pathsep.join(part for part in path.split(os.pathsep) if part != unwanted)
-
 
 def port_is_free(port: int, host: str = "0.0.0.0") -> bool:
     """адрес тот же, на котором потом будем слушать"""
@@ -342,12 +327,14 @@ def orphan_groups(settings: Settings) -> dict[int, str]:
     return groups
 
 
-async def kill_groups(pgids: Iterable[int], grace: float = 15) -> None:
-    alive = set(pgids)
+async def kill_orphans(settings: Settings) -> list[str]:
+    """после kill -9 прокси инстансы остаются и держат память"""
+    groups = await asyncio.to_thread(orphan_groups, settings)
+    alive = set(groups)
     for pgid in alive:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, signal.SIGTERM)
-    deadline = time.monotonic() + grace
+    deadline = time.monotonic() + 15
     while alive and time.monotonic() < deadline:
         await asyncio.sleep(0.5)
         for pgid in list(alive):
@@ -358,12 +345,6 @@ async def kill_groups(pgids: Iterable[int], grace: float = 15) -> None:
     for pgid in alive:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, signal.SIGKILL)
-
-
-async def kill_orphans(settings: Settings) -> list[str]:
-    """после kill -9 прокси инстансы остаются и держат память"""
-    groups = await asyncio.to_thread(orphan_groups, settings)
-    await kill_groups(groups)
     return [f"{name} (группа {pgid})" for pgid, name in groups.items()]
 
 
@@ -423,7 +404,9 @@ class Instance:
 
     @property
     def holds_gb(self) -> float:
-        return {State.AWAKE: self.footprint, State.ASLEEP: self.tail}.get(self.state, 0.0)
+        if self.state is State.AWAKE:
+            return self.footprint
+        return self.tail if self.state is State.ASLEEP else 0.0
 
     @property
     def frees_gb(self) -> float:
@@ -449,8 +432,10 @@ class Instance:
 
     def devices_seen(self) -> set[str]:
         """что видят процессы на самом деле. скрипт мог переписать то, что мы передали"""
+        if self.process is None:
+            return set()
         seen = set()
-        for pid in group_members(self.process.pid) if self.process else []:
+        for pid in group_members(self.process.pid):
             with contextlib.suppress(OSError):
                 for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
                     if item.startswith(b"CUDA_VISIBLE_DEVICES="):
@@ -507,7 +492,10 @@ class Instance:
     def environment(self) -> dict[str, str]:
         """без следов окружения прокси, с настройками модели и переменными vLLM"""
         env = {key: value for key, value in os.environ.items() if key not in STRIPPED_ENV}
-        env["PATH"] = strip_venv_from_path(env.get("PATH", ""), os.environ.get("VIRTUAL_ENV"))
+        if venv := os.environ.get("VIRTUAL_ENV"):   # иначе инстанс подхватит питон прокси
+            venv_bin = str(Path(venv) / "bin")
+            env["PATH"] = os.pathsep.join(part for part in env.get("PATH", "").split(os.pathsep)
+                                          if part != venv_bin)
         env.update(self.settings.env)
         env.update(self.spec.env)
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
@@ -813,18 +801,14 @@ class Cluster:
             await asyncio.sleep(0.2)
         return True
 
-    def is_stale(self, instance: Instance) -> bool:
-        """спящая на карте, где ей уже не проснуться. память забрал чужой процесс"""
-        return (instance.state is State.ASLEEP and self.gpus[instance.gpu_id].evictable(
-            instance.spec, instance.wake_need, wait=True) is None)
-
     async def drop_stale(self, spec: ModelSpec) -> bool:
+        """спящая на карте, где ей уже не проснуться. память забрал чужой процесс"""
         instance = self.instances.get(spec.name)
-        if instance is None or not self.is_stale(instance):
+        if instance is None or instance.state is not State.ASLEEP:
             return False
         gpu = self.gpus[instance.gpu_id]
-        if gpu.lock.locked():
-            return False
+        if gpu.lock.locked() or gpu.evictable(spec, instance.wake_need, wait=True) is not None:
+            return False        # подвинуть есть кого, значит копия ещё проснётся
         log.warning("%s: на GPU%s свободно %.1f ГБ, для пробуждения нужно %.1f, и подвинуть некого "
                     "— память держит посторонний процесс (nvidia-smi). Запускаю заново там, где "
                     "есть место", spec.name, gpu.id, gpu.memory.free_gb,
@@ -841,17 +825,15 @@ class Cluster:
             return sleeper.wake_need
         return max(spec.vram_gb, self.footprints.get(spec.name, 0.0))
 
-    def crowds(self, gpu: Gpu, spec: ModelSpec, victims: list[Instance]) -> bool:
-        """тех, кого при этом остановят, уже не считаем"""
-        gone = [v for v in victims if v.state is State.ASLEEP or not v.can_sleep]
-        tail = self.tails.get(spec.name, self.settings.asleep_tail_gb)
-        return gpu.crowded((self.need_for(spec, None), tail), gone)
-
     def plan(self, spec: ModelSpec, mine: Gpu | None = None) -> tuple[Gpu, Instance | None]:
         """разбудить спящую всегда выгоднее, чем поднимать новую"""
         options = self.candidates(spec, mine)
         if not options:
-            raise self.nowhere(spec)
+            if self.gpus and all(gpu.blocked for gpu in self.gpus.values()):
+                raise TrainingInProgress(f"{spec.name}: все карты отданы под обучение, "
+                                         f"модели вернутся, когда оно закончится")
+            raise NoRoom(f"{spec.name}: {spec.vram_gb:.1f} ГБ не найдётся нигде. "
+                         + "; ".join(map(repr, self.gpus.values())))
         key, _, gpu, sleeper = min(options, key=lambda option: option[:2])
         if key[0] and spec.name not in self.crowd_warned:      # key[0] это признак тесноты
             self.crowd_warned.add(spec.name)
@@ -874,7 +856,9 @@ class Cluster:
             must_wait = victims is None
             if victims is None and (victims := gpu.evictable(spec, need, wait=True)) is None:
                 continue
-            key = (sleeper is None and self.crowds(gpu, spec, victims),
+            gone = [v for v in victims if v.state is State.ASLEEP or not v.can_sleep]
+            tail = self.tails.get(spec.name, self.settings.asleep_tail_gb)
+            key = (sleeper is None and gpu.crowded((need, tail), gone),
                    gpu.lock.locked() and gpu is not mine,
                    sum(v.spec.priority for v in victims),
                    must_wait, len(victims),
@@ -882,13 +866,6 @@ class Cluster:
                    -gpu.memory.free_gb)
             options.append((key, gpu.id, gpu, sleeper))
         return options
-
-    def nowhere(self, spec: ModelSpec) -> NoRoom:
-        if self.gpus and all(gpu.blocked for gpu in self.gpus.values()):
-            return TrainingInProgress(f"{spec.name}: все карты отданы под обучение, "
-                                      f"модели вернутся, когда оно закончится")
-        return NoRoom(f"{spec.name}: {spec.vram_gb:.1f} ГБ не найдётся нигде. "
-                      + "; ".join(map(repr, self.gpus.values())))
 
     # память карт
 
@@ -957,14 +934,10 @@ class Cluster:
         finally:
             for instance in victims:
                 instance.leaving = False
-        await self.settle(gpu, need)
-
-    async def settle(self, gpu: Gpu, need: float) -> None:
-        """драйвер отдаёт память остановленного процесса не мгновенно"""
-        deadline = time.monotonic() + 10
         await self.refresh(max_age=0)
-        while not gpu.fits(need) and time.monotonic() < deadline:
-            await asyncio.sleep(0.5)
+        settled = time.monotonic() + 10
+        while not gpu.fits(need) and time.monotonic() < settled:
+            await asyncio.sleep(0.5)      # драйвер отдаёт память остановленного процесса не сразу
             await self.refresh(max_age=0)
         if not gpu.fits(need):
             raise NoRoom(f"на GPU{gpu.id} после вытеснения {gpu.memory.free_gb:.1f} из нужных "
@@ -1239,17 +1212,11 @@ class Cluster:
         """раз в 15 секунд. эта задача не должна умирать ни при какой ошибке"""
         while True:
             await asyncio.sleep(15)
-            try:
-                await self.tidy()
-            except Exception as error:
-                log.warning("уборка сорвалась: %s", error)
-
-    async def tidy(self) -> None:
-        for step in (self.check_leases, self.reap, self.restore_priority):
-            try:
-                await step()
-            except Exception as error:
-                log.warning("уборка (%s) не удалась: %s", step.__name__, error)
+            for step in (self.check_leases, self.reap, self.restore_priority):
+                try:
+                    await step()
+                except Exception as error:
+                    log.warning("уборка (%s) не удалась: %s", step.__name__, error)
 
     async def reap(self) -> None:
         """карты, где идёт переключение, не трогаем"""
@@ -1292,14 +1259,12 @@ class Cluster:
             await self.refresh()
             if instance is not None:
                 await self.revive(self.gpus[instance.gpu_id], spec, instance)
-            else:
-                await self.revive(self.roomiest(self.need_for(spec, None)), spec, None)
-
-    def roomiest(self, need: float) -> Gpu | None:
-        """самая свободная из тех, куда модель встанет никого не двигая"""
-        free = [g for g in self.gpus.values()
-                if not g.blocked and not g.lock.locked() and g.fits(need)]
-        return max(free, key=lambda g: g.memory.free_gb) if free else None
+                continue
+            # самая свободная из тех, куда модель встанет никого не двигая
+            free = [g for g in self.gpus.values() if not g.blocked and not g.lock.locked()
+                    and g.fits(self.need_for(spec, None))]
+            if free:
+                await self.revive(max(free, key=lambda g: g.memory.free_gb), spec, None)
 
     async def revive(self, gpu: Gpu | None, spec: ModelSpec, sleeper: Instance | None) -> None:
         if gpu is None or gpu.blocked or gpu.lock.locked():
@@ -1365,13 +1330,6 @@ def training_request(body: dict) -> tuple[list[int] | None, str, int | None, flo
     if need is not None and (isinstance(need, bool) or not isinstance(need, (int, float))):
         raise HTTPException(400, "vram_gb должен быть числом ГБ или null")
     return gpus, str(body.get("owner") or "обучение"), pid, float(need) if need else None
-
-
-def usage_of(response: httpx.Response) -> dict:
-    """оборванное тело не должно ронять уже отработавший запрос"""
-    with contextlib.suppress(ValueError, AttributeError):
-        return response.json().get("usage") or {}
-    return {}
 
 
 class Stream:
@@ -1515,8 +1473,13 @@ class Proxy:
             instance = await self.cluster.acquire(name)
             if (waited := time.monotonic() - started) > 1:
                 log.info("%s место получено за %.1f сек", tag, waited)
-            upstream = await self.inference.send(
-                self.build(instance, name, path, query, raw, body), stream=True)
+            # алиас в поле model меняем на имя, под которым vLLM знает модель
+            content = raw if body.get("model") == name else \
+                json.dumps({**body, "model": name}, ensure_ascii=False).encode()
+            request = self.inference.build_request(
+                "POST", f"{instance.url}/v1/{path}" + (f"?{query}" if query else ""),
+                content=content, headers={"content-type": "application/json"})
+            upstream = await self.inference.send(request, stream=True)
             if upstream.headers.get("content-type", "").startswith("text/event-stream"):
                 response = self.relay(upstream, instance, tag, started)
                 instance = upstream = None      # дальше модель и соединение отпустит relay
@@ -1524,37 +1487,19 @@ class Proxy:
             await upstream.aread()
             return self.finish(upstream, tag, started)
         except NoRoom as error:
-            raise self.no_room(tag, error)
+            log.error("%s %s", tag, error)
+            retry = "300" if isinstance(error, TrainingInProgress) else "30"
+            raise HTTPException(503, str(error), headers={"Retry-After": retry})
         except (httpx.HTTPError, RuntimeError, OSError, ValueError) as error:
-            raise self.upstream_failed(tag, name, instance, error)
+            log.error("%s %s не отработала: %s", tag, name, error)
+            if instance is not None:      # пусть следующий запрос не бьётся о труп
+                self.cluster.spawn(self.cluster.reap_dead(instance))
+            raise HTTPException(502, f"{name}: {error}")
         finally:
             if instance is not None:
                 instance.release()
             if upstream is not None:
                 await upstream.aclose()
-
-    @staticmethod
-    def no_room(tag: str, error: NoRoom) -> HTTPException:
-        log.error("%s %s", tag, error)
-        retry = "300" if isinstance(error, TrainingInProgress) else "30"
-        return HTTPException(503, str(error), headers={"Retry-After": retry})
-
-    def upstream_failed(self, tag: str, name: str, instance: Instance | None,
-                        error: Exception) -> HTTPException:
-        """заодно проверяем в фоне, не умерла ли копия"""
-        log.error("%s %s не отработала: %s", tag, name, error)
-        if instance is not None:      # пусть следующий запрос не бьётся о труп
-            self.cluster.spawn(self.cluster.reap_dead(instance))
-        return HTTPException(502, f"{name}: {error}")
-
-    def build(self, instance: Instance, name: str, path: str, query: str,
-              raw: bytes, body: dict) -> httpx.Request:
-        """алиас в поле model меняем на имя, под которым vLLM знает модель"""
-        content = raw if body.get("model") == name else \
-            json.dumps({**body, "model": name}, ensure_ascii=False).encode()
-        return self.inference.build_request(
-            "POST", f"{instance.url}/v1/{path}" + (f"?{query}" if query else ""),
-            content=content, headers={"content-type": "application/json"})
 
     def relay(self, upstream: httpx.Response, instance: Instance,
               tag: str, started: float) -> StreamingResponse:
@@ -1574,7 +1519,9 @@ class Proxy:
         elif "application/json" not in content_type:
             log.warning("%s не-JSON ответ", tag)
         elif log.isEnabledFor(logging.INFO):    # разбирать тело стоит только ради строчки в логе
-            usage = usage_of(response)
+            usage = {}
+            with contextlib.suppress(ValueError, AttributeError):   # тело могло оборваться
+                usage = response.json().get("usage") or {}
             log.info("%s ответ за %.1f сек, токенов: %s + %s", tag, time.monotonic() - started,
                      usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"))
         return Response(response.content, response.status_code, media_type=content_type)
@@ -1641,14 +1588,6 @@ async def announce(settings: Settings, cluster: Cluster, log_path: Path, killed:
                     ", ".join(missing))
 
 
-def check_ports(settings: Settings) -> None:
-    busy = [port for port in settings.listen if not port_is_free(port)]
-    if not port_is_free(settings.admin_port, "127.0.0.1"):
-        busy.append(settings.admin_port)
-    if busy:
-        fail(f"порты {busy} уже заняты, прокси уже запущена?")
-
-
 def install_signals(stop: asyncio.Event) -> None:
     """первый сигнал просит остановиться, второй выходит не дожидаясь моделей"""
     def on_signal() -> None:
@@ -1666,7 +1605,11 @@ def install_signals(stop: asyncio.Event) -> None:
 async def main() -> None:
     settings = Settings.load(os.getenv("CONFIG", HERE / "config.yaml"))
     path = setup_logging(Path(os.getenv("LOG_DIR", HERE / "logs")), settings.log_keep)
-    check_ports(settings)
+    busy = [port for port in settings.listen if not port_is_free(port)]
+    if not port_is_free(settings.admin_port, "127.0.0.1"):
+        busy.append(settings.admin_port)
+    if busy:
+        fail(f"порты {busy} уже заняты, прокси уже запущена?")
     killed = await kill_orphans(settings)
     cluster = Cluster(settings)
 
