@@ -1,4 +1,4 @@
-"""Общая обвязка тестов: конфиги во временном каталоге и копии моделей без настоящих процессов."""
+"""Общая обвязка тестов. Конфиги во временном каталоге и копии моделей без настоящих процессов."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def one_model(**over) -> dict:
 
 
 def production(**over) -> dict:
-    """Конфиг как на бою: четыре модели по две на порт, одна приоритетная."""
+    """Конфиг как на бою. Четыре модели по две на порт, одна приоритетная."""
     def model(vram: float, port: int, **extra) -> dict:
         return {"cwd": str(ROOT / "model"), "script": str(SCRIPT),
                 "vram_gb": vram, "port": port, **extra}
@@ -79,7 +79,7 @@ class FakeInstance(P.Instance):
     """Копия модели без настоящего процесса vLLM."""
 
     slow_probe = False     # растягивает опрос карты, чтобы ловить гонки
-    tail_real = 1.0        # сколько ГБ «остаётся» на карте после засыпания
+    tail_real = 1.0        # сколько ГБ остаётся на карте после засыпания
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -114,7 +114,7 @@ class FakeInstance(P.Instance):
 
 
 def cluster(settings: P.Settings, cards: int = 2, card_gb: float = 16.0) -> P.Cluster:
-    """Кластер на фейковых картах: свободная память считается по тому, что держат копии."""
+    """Кластер на фейковых картах. Свободная память считается по тому, что держат копии."""
     async def probe():
         if FakeInstance.slow_probe:
             await asyncio.sleep(0.05)

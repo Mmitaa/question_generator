@@ -25,7 +25,7 @@ async def race(cl, sleeper_call):
 
 
 async def old_put_to_sleep(cl, instance, gpu):
-    """Как было до правки: вход закрывается уже после опроса карты."""
+    """Как было до правки. Вход закрывается уже после опроса карты."""
     await cl.free_now(gpu)
     await instance.set_sleeping(True)
     await cl.free_now(gpu)

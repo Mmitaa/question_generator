@@ -1,4 +1,4 @@
-"""Сквозная проверка HTTP-слоя: реальный uvicorn-фейк вместо vLLM."""
+"""Сквозная проверка HTTP слоя на настоящем uvicorn вместо vLLM."""
 import asyncio
 import json
 import sys
@@ -34,7 +34,7 @@ async def fake_post(path: str, request: Request):
     return JSONResponse({"model": body["model"], "usage": {"prompt_tokens": 3, "completion_tokens": 1}})
 
 class Wired(P.Instance):
-    """Копия, которая уже «поднята» и указывает на фейковый vLLM."""
+    """Копия, которая уже поднята и указывает на подставной vLLM."""
     upstream_port = 0
     async def start(self):
         self.port = Wired.upstream_port

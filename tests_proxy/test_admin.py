@@ -1,4 +1,4 @@
-"""Служебный порт: /health и аренда карт через HTTP."""
+"""Служебный порт. Ручка /health и аренда карт через HTTP."""
 import asyncio
 import sys
 
