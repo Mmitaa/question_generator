@@ -20,7 +20,7 @@ async def main():
 
     lease = await cl.start_training(None, "sft", None, vram_gb=25.0)
     check("25 ГБ -> обе карты", sorted(lease.gpus) == [0, 1], f"взяла {sorted(lease.gpus)}")
-    check("все модели погашены", cl.all_instances() == [])
+    check("все модели погашены", cl.instances == {})
     try:
         await cl.acquire("grade-ai"); check("во время обучения 503", False)
     except P.TrainingInProgress:

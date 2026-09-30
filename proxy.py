@@ -11,7 +11,6 @@ import logging
 import logging.handlers
 import os
 import re
-import shlex
 import signal
 import socket
 import time
@@ -32,7 +31,6 @@ HERE = Path(__file__).parent
 log = logging.getLogger("proxy")
 
 SAFE_PATH = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*")   # без точек и процентов: через них видны служебные ручки vLLM
-BIG_BODY = 1_000_000            # тела крупнее разбираем в отдельном потоке
 PORT_STEP = 10                  # vLLM занимает порты сразу за своим, поэтому раздаём с запасом
 RESIDENCY_GRACE = 3.0           # столько секунд без запросов — и свежую копию уже не защищаем
 STREAM_BUFFER = 32 * 2 ** 20    # столько байт стрима копим медленному клиенту, дальше рвём его
@@ -40,10 +38,7 @@ GIB = 1024 ** 3
 PROC_SCAN_LIMIT = 2.0           # потолок паузы между обходами /proc
 
 STRIPPED_ENV = ("VIRTUAL_ENV", "POETRY_ACTIVE", "PYTHONHOME", "PYTHONPATH")
-MODEL_KEYS = frozenset({"cmd", "cwd", "script", "vram_gb", "port", "aliases",
-                        "priority", "replicas", "env", "log_dir"})
-PARALLEL_FLAGS = frozenset({"--tensor-parallel-size", "-tp", "--pipeline-parallel-size", "-pp",
-                            "--data-parallel-size", "-dp"})
+MODEL_KEYS = frozenset({"cwd", "script", "vram_gb", "port", "aliases", "priority", "env"})
 TRAINING_KEYS = frozenset({"gpus", "pid", "owner", "vram_gb"})
 
 
@@ -67,15 +62,12 @@ class ModelSpec:
     """Описание одной модели из конфига."""
 
     name: str
-    cmd: list[str]
     cwd: Path
+    script: Path
     vram_gb: float
     port: int
-    script: Path | None = None
-    log_dir: Path | None = None
     aliases: tuple[str, ...] = ()
     priority: bool = False
-    replicas: int = 1
     env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -85,13 +77,10 @@ class ModelSpec:
             fail(f"{name}: непонятные поля {', '.join(unknown)}. "
                  f"Допустимы: {', '.join(sorted(MODEL_KEYS))}")
         try:
-            spec = cls(name=name, cmd=shlex.split(raw.get("cmd", "")), cwd=Path(raw["cwd"]),
+            spec = cls(name=name, cwd=Path(raw["cwd"]), script=Path(raw["script"]),
                        vram_gb=float(raw["vram_gb"]), port=int(raw["port"]),
-                       script=Path(raw["script"]) if raw.get("script") else None,
-                       log_dir=Path(raw["log_dir"]) if raw.get("log_dir") else None,
                        aliases=tuple(raw.get("aliases", ())),
                        priority=bool(raw.get("priority")),
-                       replicas=int(raw.get("replicas", 1)),
                        env={k: str(v) for k, v in (raw.get("env") or {}).items()})
         except KeyError as error:
             fail(f"{name}: в конфиге нет обязательного поля {error.args[0]}")
@@ -101,34 +90,14 @@ class ModelSpec:
         return spec
 
     def validate(self) -> None:
-        """Проверяет пути, счётчики и флаги запуска; сообщает обо всех ошибках разом."""
+        """Проверяет пути и объём; сообщает обо всех ошибках разом."""
         broken = [message for bad, message in (
-            (bool(self.script) == bool(self.cmd), "укажите либо script, либо cmd, но не оба"),
-            (self.script is not None and not self.script.exists(), f"скрипта {self.script} нет"),
+            (not self.script.is_file(), f"скрипта {self.script} нет"),
             (not self.cwd.is_dir(), f"каталога {self.cwd} нет"),
-            (self.replicas < 1, "replicas должно быть не меньше 1"),
             (self.vram_gb <= 0, "vram_gb должно быть больше нуля"),
-            (bool(self.multi_gpu_flag()),
-             f"{self.multi_gpu_flag()} — прокси ставит модель на одну карту и несколько карт "
-             f"на инстанс не умеет; уберите флаг или запускайте модель мимо прокси"),
-            (self.cmd[:1] == ["poetry"] and not self.has_pyproject(),
-             f"ни в {self.cwd}, ни выше нет pyproject.toml — poetry run там не заработает"),
         ) if bad]
         if broken:
             fail(f"{self.name}: " + "; ".join(broken))
-
-    def multi_gpu_flag(self) -> str | None:
-        """Ищет в cmd флаг многокарточного запуска."""
-        for flag, value in itertools.zip_longest(self.cmd, self.cmd[1:], fillvalue=""):
-            head, _, inline = flag.partition("=")
-            if head in PARALLEL_FLAGS and (inline or value) not in ("", "1"):
-                return f"{head} {inline or value}"
-        return None
-
-    def has_pyproject(self) -> bool:
-        """Есть ли pyproject.toml в рабочем каталоге или выше."""
-        return any((folder / "pyproject.toml").exists()
-                   for folder in (self.cwd, *self.cwd.parents))
 
 
 @dataclass(frozen=True)
@@ -142,7 +111,6 @@ class Settings:
     api_key: str | None = None
     reserve_gb: float = 1.0
     asleep_tail_gb: float = 0.5
-    sleep_level: int = 1
     idle_sleep_sec: float = 120
     idle_stop_sec: float = 3600
     min_residency_sec: float = 30
@@ -151,7 +119,6 @@ class Settings:
     queue_timeout: float = 180
     drain_timeout: float = 600
     read_timeout: float | None = None
-    scale_up_busy: int = 8
     log_keep: int = 20
     preload: bool = True
     vllm_log_level: str = "INFO"
@@ -184,20 +151,18 @@ class Settings:
 
     def _check_limits(self) -> None:
         """Проверяет числовые настройки; сообщает обо всех ошибках разом."""
-        copies = sum(spec.replicas for spec in self.models.values())
         broken = [message for bad, message in (
             (not self.models, "в конфиге нет ни одной модели"),
             (not self.internal_ports, "internal_ports пуст: укажите [низ, верх]"),
-            (self.sleep_level not in (1, 2), f"sleep_level должен быть 1 или 2, а не {self.sleep_level}"),
             (min(self.reserve_gb, self.asleep_tail_gb) < 0,
              "reserve_gb и asleep_tail_gb не могут быть отрицательными"),
             (self.min_residency_sec >= self.queue_timeout,
              "min_residency_sec должен быть меньше queue_timeout, иначе ждущие не дождутся карты"),
             (self.admin_port in self.internal_ports,
              f"admin_port {self.admin_port} попал в internal_ports"),
-            (len(self.internal_ports) < copies,
+            (len(self.internal_ports) < len(self.models),
              f"internal_ports вмещает {len(self.internal_ports)} портов, "
-             f"а копий моделей может быть до {copies}"),
+             f"а моделей {len(self.models)}"),
         ) if bad]
         if broken:
             fail("; ".join(broken))
@@ -285,16 +250,6 @@ def new_log(folder: Path, prefix: str, keep: int = 20) -> Path:
         link.unlink(missing_ok=True)
         link.symlink_to(path.name)
     return path
-
-
-def encode_json(body: dict) -> bytes:
-    """Собирает тело запроса обратно в JSON."""
-    return json.dumps(body, ensure_ascii=False).encode()
-
-
-async def off_loop(func: Callable[..., Any], *args: Any, size: int) -> Any:
-    """Разбор крупных тел уводит в поток, чтобы не держать event loop."""
-    return await asyncio.to_thread(func, *args) if size > BIG_BODY else func(*args)
 
 
 async def wait_unlocked(lock: asyncio.Lock, deadline: float, what: str) -> None:
@@ -438,13 +393,12 @@ class Instance:
     """Одна копия модели — один процесс vLLM."""
 
     def __init__(self, spec: ModelSpec, gpu_id: int, port: int, settings: Settings,
-                 client: httpx.AsyncClient, index: int = 0):
+                 client: httpx.AsyncClient):
         self.spec = spec
         self.gpu_id = gpu_id
         self.port = port
         self.settings = settings
         self.client = client
-        self.index = index
         self.state = State.STOPPED
         self.busy = 0
         self.leaving = False
@@ -456,12 +410,7 @@ class Instance:
         self.process: asyncio.subprocess.Process | None = None
 
     def __repr__(self) -> str:
-        return f"<{self.label} GPU{self.gpu_id}:{self.port} {self.state.value}>"
-
-    @property
-    def label(self) -> str:
-        """Имя копии для логов."""
-        return self.spec.name if self.index == 0 else f"{self.spec.name}#{self.index + 1}"
+        return f"<{self.spec.name} GPU{self.gpu_id}:{self.port} {self.state.value}>"
 
     @property
     def url(self) -> str:
@@ -535,10 +484,6 @@ class Instance:
                 and now - self.awake_since < self.settings.min_residency_sec
                 and (self.busy > 0 or now - self.last_used < RESIDENCY_GRACE))
 
-    def accepts(self, model: Any) -> bool:
-        """Знает ли vLLM это имя сам; алиасы он получает только при запуске через cmd."""
-        return model == self.spec.name or (self.spec.script is None and model in self.spec.aliases)
-
     def reserve(self) -> bool:
         """Занимает копию под запрос. Без await: между проверкой и захватом никто не влезет."""
         if self.state is State.AWAKE and self.alive and not self.leaving:
@@ -555,37 +500,29 @@ class Instance:
 
     async def start(self) -> None:
         """Запускает процесс, ждёт /health и прогревает модель."""
-        prefix = self.spec.name if self.index == 0 else f"{self.spec.name}-r{self.index + 1}"
-        path = new_log(self.spec.log_dir or self.spec.cwd / "logs", prefix, self.settings.log_keep)
+        path = new_log(self.spec.cwd / "logs", self.spec.name, self.settings.log_keep)
         self.state = State.STARTING
-        log.info("запускаю %s на GPU%s, порт %s, лог %s", self.label, self.gpu_id, self.port, path)
+        log.info("запускаю %s на GPU%s, порт %s, лог %s", self.spec.name, self.gpu_id, self.port, path)
 
         with open(path, "wb") as sink:
             # отдельная группа, чтобы при остановке убить и bash-обёртку, и сам vLLM
             self.process = await asyncio.create_subprocess_exec(
-                *self.command(), cwd=self.spec.cwd, env=self.environment(), start_new_session=True,
+                "bash", str(self.spec.script), cwd=self.spec.cwd, env=self.environment(), start_new_session=True,
                 stdout=sink, stderr=asyncio.subprocess.STDOUT)
 
         deadline = time.monotonic() + self.settings.start_timeout
         while time.monotonic() < deadline:
             if not self.alive:
-                raise RuntimeError(f"{self.label}: процесс умер при старте, см. {path}")
+                raise RuntimeError(f"{self.spec.name}: процесс умер при старте, см. {path}")
             if await self.responds():
                 self.state = State.AWAKE
                 self.awake_since = time.monotonic()
                 await self.warm_up()
-                log.info("%s поднялась", self.label)
+                log.info("%s поднялась", self.spec.name)
                 return
             await asyncio.sleep(2)
-        raise RuntimeError(f"{self.label}: не поднялась за "
+        raise RuntimeError(f"{self.spec.name}: не поднялась за "
                            f"{self.settings.start_timeout:.0f} сек, см. {path}")
-
-    def command(self) -> list[str]:
-        """Собирает команду запуска: свой скрипт или cmd с флагами vLLM."""
-        if self.spec.script:
-            return ["bash", str(self.spec.script)]
-        return [*self.spec.cmd, "--port", str(self.port),
-                "--served-model-name", self.spec.name, *self.spec.aliases, "--enable-sleep-mode"]
 
     def environment(self) -> dict[str, str]:
         """Собирает окружение процесса: без следов venv прокси, с настройками модели и vLLM."""
@@ -599,22 +536,19 @@ class Instance:
         env["PROXY_INSTANCE"] = f"{self.spec.name}:{self.port}"   # по метке следующий запуск найдёт хвосты
         env["VLLM_SERVED_NAME"] = self.spec.name
         env["VLLM_LOGGING_LEVEL"] = self.settings.vllm_log_level
-        if self.spec.script:
-            env["VLLM_PORT"] = str(self.port)
-        else:
-            env.pop("VLLM_PORT", None)            # порт уже передан флагом, иначе vLLM займёт соседние
+        env["VLLM_PORT"] = str(self.port)         # скрипт обязан отдать его vLLM флагом --port
         return env
 
     async def stop(self) -> None:
         """Останавливает процесс: сначала мягко, через 30 секунд убивает."""
         self.leaving = True
         if self.alive:
-            log.info("останавливаю %s", self.label)
+            log.info("останавливаю %s", self.spec.name)
             self.signal_group(signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.process.wait(), 30)
             except asyncio.TimeoutError:
-                log.warning("%s не завершилась за 30 сек — убиваю", self.label)
+                log.warning("%s не завершилась за 30 сек — убиваю", self.spec.name)
                 self.signal_group(signal.SIGKILL)
                 await self.process.wait()
         if self.process is not None:
@@ -652,12 +586,12 @@ class Instance:
         if self.state is not (State.AWAKE if sleeping else State.ASLEEP):
             return False
         started = time.monotonic()
-        log.info("%s %s", "усыпляю" if sleeping else "бужу", self.label)
+        log.info("%s %s", "усыпляю" if sleeping else "бужу", self.spec.name)
         with self.held():
             await self._switch(sleeping)
             await self.await_state(sleeping)
             self.state = State.ASLEEP if sleeping else State.AWAKE
-            log.info("%s %s за %.1f сек", self.label,
+            log.info("%s %s за %.1f сек", self.spec.name,
                      "уснула" if sleeping else "проснулась", time.monotonic() - started)
             if not sleeping:
                 self.awake_since = time.monotonic()
@@ -665,23 +599,15 @@ class Instance:
         return True
 
     async def _switch(self, sleeping: bool) -> None:
-        """Дёргает ручку сна или пробуждения у vLLM; после глубокого сна заново грузит веса."""
-        level = self.settings.sleep_level
-        endpoint = f"/sleep?level={level}" if sleeping else "/wake_up"
-        response = await self._dev_post(endpoint)
+        """Дёргает ручку сна или пробуждения у vLLM."""
+        endpoint = "/sleep?level=1" if sleeping else "/wake_up"
+        response = await self.client.post(f"{self.url}{endpoint}",
+                                          timeout=self.settings.switch_timeout)
         if response.status_code == 404:
             raise RuntimeError(f"у vLLM нет {endpoint.split('?')[0]}: запущен без "
                                f"VLLM_SERVER_DEV_MODE=1, слишком старый или за портом не vLLM")
         if response.status_code != 200:
             raise RuntimeError(f"{endpoint} вернул {response.status_code}: {response.text[:300]}")
-        if not sleeping and level == 2:
-            await self._dev_post("/collective_rpc", json={"method": "reload_weights"})
-            await self._dev_post("/reset_prefix_cache")
-
-    async def _dev_post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
-        """POST в служебную ручку vLLM с таймаутом переключения."""
-        return await self.client.post(f"{self.url}{endpoint}",
-                                      timeout=self.settings.switch_timeout, **kwargs)
 
     async def await_state(self, sleeping: bool) -> None:
         """Опрашивает /is_sleeping, пока состояние не сменится; не-JSON в ответе просто ждём дальше."""
@@ -692,7 +618,7 @@ class Instance:
                 if bool(response.json().get("is_sleeping", False)) is sleeping:
                     return
             if time.monotonic() > deadline:
-                raise RuntimeError(f"{self.label}: состояние не сменилось за "
+                raise RuntimeError(f"{self.spec.name}: состояние не сменилось за "
                                    f"{self.settings.switch_timeout:.0f} сек")
             await asyncio.sleep(0.25)
 
@@ -712,9 +638,9 @@ class Instance:
             if response.status_code != 200:
                 log.warning("прогрев %s не удался: vLLM ответил %s (%s). Для моделей только под чат "
                             "или эмбеддинги это нормально, но первый запрос будет медленным",
-                            self.label, response.status_code, response.text[:200])
+                            self.spec.name, response.status_code, response.text[:200])
         except httpx.HTTPError as error:
-            log.warning("прогрев %s не удался: %s", self.label, error)
+            log.warning("прогрев %s не удался: %s", self.spec.name, error)
 
 
 # ── карта ──────────────────────────────────────────────────────────────────
@@ -824,7 +750,7 @@ class Cluster:
         self.control = control or httpx.AsyncClient(timeout=30)
         self._owns_control = control is None
         self.gpus: dict[int, Gpu] = {}
-        self.instances: dict[str, list[Instance]] = {}
+        self.instances: dict[str, Instance] = {}
         self.model_locks = {name: asyncio.Lock() for name in settings.models}
         self.probe_lock = asyncio.Lock()
         self.probed_at = 0.0
@@ -832,7 +758,6 @@ class Cluster:
         self.footprints: dict[str, float] = {}   # замеры по моделям, чтобы новая копия считалась верно
         self.tails: dict[str, float] = {}
         self.crowd_warned: set[str] = set()
-        self.scaling: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
 
     def spawn(self, coro: Awaitable[Any]) -> None:
@@ -845,8 +770,7 @@ class Cluster:
 
     async def acquire(self, name: str) -> Instance:
         """Возвращает готовую копию, уже занятую под запрос; отпускать через release()."""
-        if instance := self.fastest(name):
-            self.maybe_scale(instance)
+        if instance := self.ready(name):
             return instance
         deadline = time.monotonic() + self.settings.wait_budget
         lock = self.model_locks[name]
@@ -856,31 +780,23 @@ class Cluster:
             raise NoRoom(f"{name}: не дождались очереди за {self.settings.wait_budget:.0f} сек, "
                          f"всё это время модель поднимал другой запрос")
         try:
-            instance = self.fastest(name) or await self.ensure_ready(name, deadline)
+            return self.ready(name) or await self.ensure_ready(name, deadline)
         finally:
             lock.release()
-        self.maybe_scale(instance)
-        return instance
 
-    def fastest(self, name: str) -> Instance | None:
-        """Занимает наименее загруженную из готовых копий модели."""
-        for instance in sorted(self.instances.get(name, []), key=lambda i: i.busy):
-            if instance.reserve():
-                return instance
-        return None
-
-    def all_instances(self) -> list[Instance]:
-        """Все копии всех моделей одним списком."""
-        return [instance for group in self.instances.values() for instance in group]
+    def ready(self, name: str) -> Instance | None:
+        """Занимает копию модели, если она уже поднята и свободна."""
+        instance = self.instances.get(name)
+        return instance if instance is not None and instance.reserve() else None
 
     async def ensure_ready(self, name: str, deadline: float) -> Instance:
         """Будит спящую копию или запускает новую и занимает её. Вызывать под model_locks[name]."""
         spec = self.settings.models[name]
         while time.monotonic() <= deadline:
             await self.refresh()
-            for instance in list(self.instances.get(name, [])):
-                await self.reap_dead(instance)
-            if instance := self.fastest(name):
+            if current := self.instances.get(name):
+                await self.reap_dead(current)
+            if instance := self.ready(name):
                 return instance
             if await self.wait_moving(spec, deadline) or await self.drop_stale(spec):
                 continue
@@ -915,13 +831,12 @@ class Cluster:
 
     async def wait_moving(self, spec: ModelSpec, deadline: float) -> bool:
         """Ждёт, пока копия домучает переключение: дождаться дешевле, чем запускать новую."""
-        moving = [i for i in self.instances.get(spec.name, [])
-                  if (i.state is State.STARTING or i.leaving) and not self.gpus[i.gpu_id].blocked]
-        if not moving:
-            return False
-        gpu = self.gpus[moving[0].gpu_id]
+        instance = self.instances.get(spec.name)
+        if instance is None or instance.state is State.ASLEEP:
+            return False        # дальше plan() рассчитывает, что копии либо нет, либо она спит
+        gpu = self.gpus[instance.gpu_id]
         if gpu.lock.locked():
-            await wait_unlocked(gpu.lock, deadline, f"{moving[0].label} закончит переключение")
+            await wait_unlocked(gpu.lock, deadline, f"{spec.name} закончит переключение")
         else:
             await asyncio.sleep(0.2)
         return True
@@ -932,18 +847,20 @@ class Cluster:
             instance.spec, instance.wake_need, wait=True) is None)
 
     async def drop_stale(self, spec: ModelSpec) -> bool:
-        """Забывает спящие копии, которым уже не проснуться на своей карте."""
-        stale = [i for i in self.instances.get(spec.name, [])
-                 if self.is_stale(i) and not self.gpus[i.gpu_id].lock.locked()]
-        for instance in stale:
-            gpu = self.gpus[instance.gpu_id]
-            log.warning("%s: на GPU%s свободно %.1f ГБ, для пробуждения нужно %.1f, и подвинуть "
-                        "некого — память держит посторонний процесс (nvidia-smi). Запускаю заново "
-                        "там, где есть место", instance.label, gpu.id, gpu.memory.free_gb,
-                        gpu.required(instance.wake_need))
-            async with gpu.lock:
-                await self.forget(instance)
-        return bool(stale)
+        """Забывает спящую копию, которой уже не проснуться на своей карте."""
+        instance = self.instances.get(spec.name)
+        if instance is None or not self.is_stale(instance):
+            return False
+        gpu = self.gpus[instance.gpu_id]
+        if gpu.lock.locked():
+            return False
+        log.warning("%s: на GPU%s свободно %.1f ГБ, для пробуждения нужно %.1f, и подвинуть некого "
+                    "— память держит посторонний процесс (nvidia-smi). Запускаю заново там, где "
+                    "есть место", spec.name, gpu.id, gpu.memory.free_gb,
+                    gpu.required(instance.wake_need))
+        async with gpu.lock:
+            await self.forget(instance)
+        return True
 
     # ── выбор карты ────────────────────────────────────────────────────────
 
@@ -965,7 +882,7 @@ class Cluster:
         if not options:
             raise self.nowhere(spec)
         key, _, gpu, sleeper = min(options, key=lambda option: option[:2])
-        if key[1] and spec.name not in self.crowd_warned:      # key[1] — признак тесноты
+        if key[0] and spec.name not in self.crowd_warned:      # key[0] — признак тесноты
             self.crowd_warned.add(spec.name)
             log.warning("%s: ни на одной карте нет места держать её спящей рядом с остальными. "
                         "При переключениях соседа придётся останавливать, и его следующий запрос "
@@ -974,24 +891,19 @@ class Cluster:
 
     def candidates(self, spec: ModelSpec, mine: Gpu | None) -> list[tuple]:
         """Оценивает каждую карту под модель; чем меньше ключ, тем лучше вариант."""
-        replicas = self.instances.get(spec.name, [])
-        sleepers = {i.gpu_id: i for i in replicas if i.state is State.ASLEEP}
-        taken = {i.gpu_id for i in replicas if i.state is not State.ASLEEP}
-        can_add = sum(not self.gpus[i.gpu_id].blocked and not self.is_stale(i)
-                      for i in replicas) < spec.replicas
+        # сюда попадаем, только когда копии нет или она спит: остальное отсеял wait_moving
+        sleeper = self.instances.get(spec.name)
         now = time.monotonic()
         options = []
-        for gpu in self.gpus.values():
-            sleeper = sleepers.get(gpu.id)
-            if gpu.blocked or gpu.id in taken or (sleeper is None and not can_add):
+        for gpu in ([self.gpus[sleeper.gpu_id]] if sleeper else list(self.gpus.values())):
+            if gpu.blocked:
                 continue
             need = self.need_for(spec, sleeper)
             victims = gpu.evictable(spec, need)
             must_wait = victims is None
             if victims is None and (victims := gpu.evictable(spec, need, wait=True)) is None:
                 continue
-            key = (sleeper is None,
-                   sleeper is None and self.crowds(gpu, spec, victims),
+            key = (sleeper is None and self.crowds(gpu, spec, victims),
                    gpu.lock.locked() and gpu is not mine,
                    sum(v.spec.priority for v in victims),
                    must_wait, len(victims),
@@ -1040,11 +952,11 @@ class Cluster:
         if not 0.5 * spec.vram_gb <= total <= 2 * spec.vram_gb + 2:
             log.warning("%s: на GPU%s память выросла на %.1f ГБ, а ждали около %.1f — замер не беру. "
                         "Возможно, на карте менялось что-то чужое или скрипт сам выбирает карту",
-                        instance.label, gpu.id, grown, spec.vram_gb - base)
+                        instance.spec.name, gpu.id, grown, spec.vram_gb - base)
             return
         if spec.name not in self.footprints and abs(total - spec.vram_gb) > 0.3:
             log.warning("%s на деле занимает %.1f ГБ, а vram_gb в конфиге %.1f. Считаю по замеру",
-                        instance.label, total, spec.vram_gb)
+                        instance.spec.name, total, spec.vram_gb)
         instance.awake_gb = self.footprints[spec.name] = total
 
     def note_tail(self, instance: Instance, freed: float) -> None:
@@ -1060,7 +972,7 @@ class Cluster:
         if spec.name not in self.tails and abs(tail - self.settings.asleep_tail_gb) > 0.3:
             log.warning("%s во сне держит %.1f ГБ, а asleep_tail_gb в конфиге %.1f. Считаю по "
                         "замеру, но размещение при старте решается по конфигу — поправьте его",
-                        instance.label, tail, self.settings.asleep_tail_gb)
+                        instance.spec.name, tail, self.settings.asleep_tail_gb)
         instance.tail_gb = self.tails[spec.name] = tail
 
     # ── освобождение места ─────────────────────────────────────────────────
@@ -1145,12 +1057,11 @@ class Cluster:
     @staticmethod
     def holding(victims: list[Instance], now: float) -> str:
         """Перечисляет тех, из-за кого приходится ждать."""
-        return ", ".join(i.label for i in victims if i.busy or i.resident(now))
+        return ", ".join(i.spec.name for i in victims if i.busy or i.resident(now))
 
     async def evict(self, instance: Instance) -> None:
-        """Забирает память у копии: единственную усыпляет, лишнюю или несонливую останавливает."""
-        alone = len(self.instances.get(instance.spec.name, [])) == 1
-        if instance.state is State.AWAKE and alone and instance.can_sleep:
+        """Забирает память у копии: усыпляет, а несонливую останавливает."""
+        if instance.state is State.AWAKE and instance.can_sleep:
             if await self.put_to_sleep(instance):
                 return
         await self.forget(instance)
@@ -1169,7 +1080,7 @@ class Cluster:
             except (httpx.HTTPError, RuntimeError, ValueError) as error:
                 instance.can_sleep = False
                 log.warning("%s не засыпает (%s). Больше не укладываю: при нехватке места буду "
-                            "останавливать, и следующий запуск будет холодным", instance.label, error)
+                            "останавливать, и следующий запуск будет холодным", instance.spec.name, error)
                 return False
             finally:
                 self.invalidate()
@@ -1185,7 +1096,7 @@ class Cluster:
             self.note_awake(instance, gpu, tail, before - await self.free_now(gpu))
             return True
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
-            log.warning("%s не проснулась (%s), останавливаю и подниму заново", instance.label, error)
+            log.warning("%s не проснулась (%s), останавливаю и подниму заново", instance.spec.name, error)
             await self.forget(instance)
             return False
         finally:
@@ -1195,11 +1106,9 @@ class Cluster:
 
     async def launch(self, gpu: Gpu, spec: ModelSpec) -> Instance:
         """Запускает новую копию на карте, где место уже освобождено. Под gpu.lock."""
-        used = {i.index for i in self.instances.get(spec.name, [])}
-        instance = self.factory(spec, gpu.id, self.next_port(), self.settings, self.control,
-                                index=next(n for n in itertools.count() if n not in used))
+        instance = self.factory(spec, gpu.id, self.next_port(), self.settings, self.control)
         instance.tail_gb = self.tails.get(spec.name)
-        self.instances.setdefault(spec.name, []).append(instance)
+        self.instances[spec.name] = instance
         gpu.instances.append(instance)
         before = await self.free_now(gpu)
         try:
@@ -1212,18 +1121,15 @@ class Cluster:
         if other := (await asyncio.to_thread(instance.devices_seen)) - {str(gpu.id)}:
             log.error("%s: прокси поставила её на GPU%s, а процесс видит CUDA_VISIBLE_DEVICES=%s. "
                       "Уберите жёсткую карту из скрипта, иначе прокси путает, где чья память",
-                      instance.label, gpu.id, ", ".join(sorted(other)))
+                      instance.spec.name, gpu.id, ", ".join(sorted(other)))
         self.note_awake(instance, gpu, 0.0, before - await self.free_now(gpu))
         return instance
 
     async def forget(self, instance: Instance) -> None:
         """Останавливает копию и убирает её из учёта."""
         await instance.stop()
-        group = self.instances.get(instance.spec.name, [])
-        if instance in group:
-            group.remove(instance)
-        if not group:
-            self.instances.pop(instance.spec.name, None)
+        if self.instances.get(instance.spec.name) is instance:
+            del self.instances[instance.spec.name]
         if (gpu := self.gpus.get(instance.gpu_id)) and instance in gpu.instances:
             gpu.instances.remove(instance)
         self.invalidate()
@@ -1232,81 +1138,20 @@ class Cluster:
         """Вычёркивает копию, чей процесс упал сам; None — если копии больше нет."""
         if instance.alive or (instance.state is State.STARTING and instance.process is None):
             return instance
-        if instance in self.instances.get(instance.spec.name, []):
-            log.warning("%s: процесс умер сам — вычёркиваю", instance.label)
+        if self.instances.get(instance.spec.name) is instance:
+            log.warning("%s: процесс умер сам — вычёркиваю", instance.spec.name)
             await self.forget(instance)
         return None
 
     def next_port(self) -> int:
         """Ищет свободный внутренний порт: сначала с шагом PORT_STEP, потом любой."""
-        mine = {instance.port for instance in self.all_instances()}
+        mine = {instance.port for instance in self.instances.values()}
         ports = self.settings.internal_ports
         for port in [*ports[::PORT_STEP], *ports]:
             if port not in mine and port_is_free(port):
                 return port
         raise NoRoom("свободных внутренних портов нет: расширьте internal_ports "
                      "или проверьте процессы с прошлых запусков (ss -tlnp)")
-
-    # ── масштабирование ────────────────────────────────────────────────────
-
-    def maybe_scale(self, instance: Instance) -> None:
-        """Если даже свободнейшая копия перегружена, в фоне добавляет ещё одну."""
-        spec = instance.spec
-        working = sum(i.state in (State.AWAKE, State.STARTING)
-                      for i in self.instances.get(spec.name, []))
-        if (instance.busy < self.settings.scale_up_busy or working >= spec.replicas
-                or spec.name in self.scaling):
-            return
-        self.scaling.add(spec.name)
-        self.spawn(self.scale_up(spec))
-
-    def scale_target(self, spec: ModelSpec,
-                     mine: Gpu | None = None) -> tuple[Gpu, Instance | None] | None:
-        """Карта под ещё одну копию: только там, где не надо ждать и двигать приоритетных."""
-        replicas = self.instances.get(spec.name, [])
-        sleepers = {i.gpu_id: i for i in replicas if i.state is State.ASLEEP}
-        taken = {i.gpu_id for i in replicas if i.state is not State.ASLEEP}
-        now = time.monotonic()
-        options = []
-        for gpu in self.gpus.values():
-            sleeper = sleepers.get(gpu.id)
-            if (gpu.blocked or gpu.id in taken or (gpu.lock.locked() and gpu is not mine)
-                    or (sleeper is None and len(replicas) >= spec.replicas)):
-                continue
-            victims = gpu.evictable(spec, self.need_for(spec, sleeper))
-            if (victims is None or any(v.spec.priority for v in victims)
-                    or (sleeper is None and self.crowds(gpu, spec, victims))):
-                continue
-            key = (sleeper is None, len(victims),
-                   max((v.recency(now) for v in victims), default=0.0), -gpu.memory.free_gb)
-            options.append((key, gpu.id, gpu, sleeper))
-        if not options:
-            return None
-        _, _, gpu, sleeper = min(options, key=lambda option: option[:2])
-        return gpu, sleeper
-
-    async def scale_up(self, spec: ModelSpec) -> None:
-        """Добавляет модели ещё одну рабочую копию, если есть подходящая карта."""
-        try:
-            await self.refresh()
-            target = self.scale_target(spec)
-            if target is None:
-                log.info("%s: нагрузка высокая, но места для ещё одной копии сейчас нет", spec.name)
-                return
-            gpu, sleeper = target
-            async with gpu.lock:
-                await self.refresh()
-                if self.scale_target(spec, mine=gpu) != target:
-                    return
-                log.info("%s: нагрузка высокая, %s на GPU%s", spec.name,
-                         "бужу спящую копию" if sleeper else "добавляю копию", gpu.id)
-                await self.free_up(gpu, spec, self.need_for(spec, sleeper),
-                                   time.monotonic(), wait=False)
-                await (self.wake(sleeper) if sleeper else self.launch(gpu, spec))
-        except Exception as error:
-            log.warning("%s: не удалось добавить копию: %s", spec.name, error)
-        finally:
-            self.scaling.discard(spec.name)
 
     # ── обучение ───────────────────────────────────────────────────────────
 
@@ -1385,7 +1230,7 @@ class Cluster:
             deadline = time.monotonic() + self.settings.drain_timeout
             while any(i.busy for i in gpu.instances) and time.monotonic() < deadline:
                 await asyncio.sleep(0.5)
-            if busy := [i.label for i in gpu.instances if i.busy]:
+            if busy := [i.spec.name for i in gpu.instances if i.busy]:
                 log.warning("GPU%s: %s не доработали за %.0f сек, гашу вместе с запросами",
                             gpu.id, ", ".join(busy), self.settings.drain_timeout)
             for instance in list(gpu.instances):
@@ -1446,7 +1291,7 @@ class Cluster:
 
     async def reap(self) -> None:
         """Обходит простаивающие копии; карты, где идёт переключение, не трогает."""
-        for instance in sorted(self.all_instances(),
+        for instance in sorted(self.instances.values(),
                                key=lambda i: (i.state is State.AWAKE, i.last_used)):
             if await self.reap_dead(instance) is None or instance.busy or instance.leaving:
                 continue
@@ -1457,40 +1302,35 @@ class Cluster:
                 async with gpu.lock:
                     await self.reap_one(instance, gpu)
             except Exception as error:
-                log.warning("%s: уборка не удалась: %s", instance.label, error)
+                log.warning("%s: уборка не удалась: %s", instance.spec.name, error)
 
     async def reap_one(self, instance: Instance, gpu: Gpu) -> None:
         """Решает судьбу одной простаивающей копии. Под gpu.lock."""
-        if instance.busy or instance.leaving or instance not in gpu.instances:
+        if (instance.busy or instance.leaving or instance.spec.priority
+                or instance not in gpu.instances):
             return
         idle = instance.idle_for
-        extra = len(self.instances.get(instance.spec.name, [])) > 1
-        if extra and idle > self.settings.idle_sleep_sec:
-            log.info("%s: лишняя копия простаивает %.0f сек, останавливаю", instance.label, idle)
-            await self.forget(instance)
-        elif instance.spec.priority:
-            return
-        elif (instance.state is State.AWAKE and instance.can_sleep
+        if (instance.state is State.AWAKE and instance.can_sleep
               and idle > self.settings.idle_sleep_sec):
-            log.info("%s простаивает %.0f сек — усыпляю", instance.label, idle)
+            log.info("%s простаивает %.0f сек — усыпляю", instance.spec.name, idle)
             await self.put_to_sleep(instance)
         elif idle > self.settings.idle_stop_sec and (instance.state is State.ASLEEP
                                                      or not instance.can_sleep):
-            log.info("%s не нужна уже %.0f сек — останавливаю", instance.label, idle)
+            log.info("%s не нужна уже %.0f сек — останавливаю", instance.spec.name, idle)
             await self.forget(instance)
 
     async def restore_priority(self) -> None:
         """Держит приоритетные модели наготове, пока никто не ждёт ответа."""
-        if any(instance.busy for instance in self.all_instances()):
+        if any(instance.busy for instance in self.instances.values()):
             return
         for spec in self.settings.models.values():
-            replicas = self.instances.get(spec.name, [])
-            if not spec.priority or any(i.state in (State.AWAKE, State.STARTING) for i in replicas):
+            instance = self.instances.get(spec.name)
+            if not spec.priority or (instance is not None and instance.state is not State.ASLEEP):
                 continue
             await self.refresh()
-            if sleeper := next((i for i in replicas if i.state is State.ASLEEP), None):
-                await self.revive(self.gpus[sleeper.gpu_id], spec, sleeper)
-            elif not replicas:
+            if instance is not None:
+                await self.revive(self.gpus[instance.gpu_id], spec, instance)
+            else:
                 await self.revive(self.roomiest(self.need_for(spec, None)), spec, None)
 
     def roomiest(self, need: float) -> Gpu | None:
@@ -1520,18 +1360,24 @@ class Cluster:
             return {"error": str(error)}
         return {"gpus": [repr(gpu) for gpu in self.gpus.values()],
                 "training": [lease.describe() for lease in self.leases.values()],
-                "models": {name: [{"state": i.state.value, "gpu": i.gpu_id, "port": i.port,
-                                   "busy": i.busy, "idle_sec": round(i.idle_for),
-                                   "memory_gb": round(i.holds_gb, 2),
-                                   "measured": i.awake_gb is not None}
-                                  for i in self.instances.get(name, [])]
+                "models": {name: self.describe(self.instances.get(name))
                            for name in self.settings.models}}
+
+    @staticmethod
+    def describe(instance: Instance | None) -> dict | None:
+        """Состояние одной копии для /health."""
+        if instance is None:
+            return None
+        return {"state": instance.state.value, "gpu": instance.gpu_id, "port": instance.port,
+                "busy": instance.busy, "idle_sec": round(instance.idle_for),
+                "memory_gb": round(instance.holds_gb, 2),
+                "measured": instance.awake_gb is not None}
 
     async def shutdown(self) -> None:
         """Гасит все модели разом и закрывает HTTP-клиент, если он наш."""
         for task in list(self.tasks):
             task.cancel()
-        await asyncio.gather(*(i.stop() for i in self.all_instances()), return_exceptions=True)
+        await asyncio.gather(*(i.stop() for i in self.instances.values()), return_exceptions=True)
         if self._owns_control:
             await self.control.aclose()
 
@@ -1639,7 +1485,6 @@ class Proxy:
             return {"object": "list", "data": [{"id": name, "object": "model", "created": created,
                                                 "owned_by": "vllm"} for name in names]}
 
-        @app.get("/v1/{path:path}")
         @app.post("/v1/{path:path}")
         async def handle(path: str, request: Request):
             """Пересылает запрос модели; пути с точками и процентами не пускаем."""
@@ -1691,41 +1536,31 @@ class Proxy:
     # ── обработка запроса ──────────────────────────────────────────────────
 
     async def forward(self, port: int, path: str, request: Request) -> Response:
-        """Определяет модель по запросу и отправляет его ей."""
+        """Определяет модель по телу запроса и отправляет его ей."""
         tag = f"[#{next(self.counter)}]"
         started = time.monotonic()
-        query = request.url.query
-        if request.method == "GET":     # у GET нет тела, модель понятна только на одномодельном порту
-            name = self.settings.resolve(None, port)
-            if name is None:
-                raise HTTPException(400, f"на порту {port} несколько моделей "
-                                         f"({', '.join(self.settings.on_port(port))}), а GET не "
-                                         f"несёт поля model — обращайтесь POST-ом")
-            log.info("%s :%s GET /v1/%s -> %s", tag, port, path, name)
-            return await self.send(name, "GET", path, query, None, None, tag, started)
-
         raw = await request.body()
         body = await self.parse(raw)
         name = self.settings.resolve(body.get("model"), port)
         if name is None:
             raise HTTPException(400, f"на порту {port} доступны: "
                                      f"{', '.join(self.settings.on_port(port))}")
-        log.info("%s :%s POST /v1/%s -> %s", tag, port, path, name)
-        return await self.send(name, "POST", path, query, raw, body, tag, started)
+        log.info("%s :%s /v1/%s -> %s", tag, port, path, name)
+        return await self.send(name, path, request.url.query, raw, body, tag, started)
 
     @staticmethod
     async def parse(raw: bytes) -> dict:
         """Разбирает тело запроса и проверяет, что это JSON-объект."""
         try:
-            body = await off_loop(json.loads, raw, size=len(raw))
+            body = json.loads(raw)
         except ValueError:
             raise HTTPException(400, "тело запроса должно быть корректным JSON")
         if not isinstance(body, dict):
             raise HTTPException(400, "ожидается JSON-объект")
         return body
 
-    async def send(self, name: str, method: str, path: str, query: str, raw: bytes | None,
-                   body: dict | None, tag: str, started: float) -> Response:
+    async def send(self, name: str, path: str, query: str, raw: bytes,
+                   body: dict, tag: str, started: float) -> Response:
         """Занимает модель, пересылает ей запрос и возвращает ответ или стрим."""
         instance = upstream = None
         try:
@@ -1733,7 +1568,7 @@ class Proxy:
             if (waited := time.monotonic() - started) > 1:
                 log.info("%s место получено за %.1f сек", tag, waited)
             upstream = await self.inference.send(
-                await self.build(instance, name, method, path, query, raw, body), stream=True)
+                self.build(instance, name, path, query, raw, body), stream=True)
             if upstream.headers.get("content-type", "").startswith("text/event-stream"):
                 response = self.relay(upstream, instance, tag, started)
                 instance = upstream = None      # дальше модель и соединение отпустит relay
@@ -1765,16 +1600,14 @@ class Proxy:
             self.cluster.spawn(self.cluster.reap_dead(instance))
         return HTTPException(502, f"{name}: {error}")
 
-    async def build(self, instance: Instance, name: str, method: str, path: str, query: str,
-                    raw: bytes | None, body: dict | None) -> httpx.Request:
-        """Собирает запрос к vLLM; имя модели подменяем, только если vLLM его не знает."""
-        url = f"{instance.url}/v1/{path}" + (f"?{query}" if query else "")
-        if raw is None:
-            return self.inference.build_request(method, url)
-        content = raw if instance.accepts(body.get("model")) else \
-            await off_loop(encode_json, {**body, "model": name}, size=len(raw))
-        return self.inference.build_request(method, url, content=content,
-                                            headers={"content-type": "application/json"})
+    def build(self, instance: Instance, name: str, path: str, query: str,
+              raw: bytes, body: dict) -> httpx.Request:
+        """Собирает запрос к vLLM; алиас в поле model заменяем на имя, под которым он её знает."""
+        content = raw if body.get("model") == name else \
+            json.dumps({**body, "model": name}, ensure_ascii=False).encode()
+        return self.inference.build_request(
+            "POST", f"{instance.url}/v1/{path}" + (f"?{query}" if query else ""),
+            content=content, headers={"content-type": "application/json"})
 
     def relay(self, upstream: httpx.Response, instance: Instance,
               tag: str, started: float) -> StreamingResponse:

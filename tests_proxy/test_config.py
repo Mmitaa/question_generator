@@ -9,26 +9,23 @@ print("\n[конфиг]")
 s = load(one_model())
 check("валидный конфиг грузится", s.models["m"].vram_gb == 10)
 check("wait_budget = queue + start", s.wait_budget == s.queue_timeout + s.start_timeout)
-bad = {"cmd": "v", "cwd": str(ROOT / "model"), "vram_gb": 1, "port": 8000}
+bad = {"script": str(SCRIPT), "cwd": str(ROOT / "model"), "vram_gb": 1, "port": 8000}
 expect_exit("опечатка в поле модели", one_model(models={"m": {**bad, "prioriti": True}}),
             "непонятные поля")
-expect_exit("нет обязательного cwd", one_model(models={"m": {"cmd": "v", "vram_gb": 1, "port": 8000}}),
+expect_exit("нет обязательного cwd",
+            one_model(models={"m": {"script": str(SCRIPT), "vram_gb": 1, "port": 8000}}),
             "обязательного поля cwd")
 expect_exit("опечатка в корне", one_model(idle_slep_sec=5), "непонятные поля")
 expect_exit("плохой sleep_level", one_model(sleep_level=3), "sleep_level")
-expect_exit("tensor-parallel ловится",
-            one_model(models={"m": {**bad, "cmd": "vllm serve X --tensor-parallel-size 2"}}), "одну")
-expect_exit("tp через знак равно", one_model(models={"m": {**bad, "cmd": "vllm serve X -tp=4"}}), "одну")
-check("tp 1 проходит", load(one_model(models={"m": {**bad, "cmd": "vllm serve X -tp 1"}}))
-      .models["m"].cmd[-1] == "1")
-expect_exit("портов меньше, чем копий",
-            one_model(internal_ports=[9000, 9000], models={"m": {**bad, "replicas": 3}}),
+expect_exit("портов меньше, чем моделей",
+            one_model(internal_ports=[9000, 9000],
+                      models={"a": {**bad, "port": 8000}, "b": {**bad, "port": 8001}}),
             "internal_ports вмещает")
 expect_exit("битый internal_ports", one_model(internal_ports=5), "парой чисел")
-expect_exit("и script, и cmd сразу",
-            one_model(models={"m": {**bad, "script": str(SCRIPT)}}), "либо script, либо cmd")
+expect_exit("несуществующий скрипт",
+            one_model(models={"m": {**bad, "script": "/нет/такого.sh"}}), "скрипта")
 expect_exit("несколько ошибок разом сообщаются вместе",
-            one_model(sleep_level=7, reserve_gb=-1), "; ")
+            one_model(reserve_gb=-1, min_residency_sec=9999), "; ")
 
 print("\n[маршрутизация по портам]")
 prod = load(production())
@@ -67,8 +64,8 @@ print("\n[маршруты и порты]")
 app = P.Proxy(s, None).application(8000)
 routes = {(r.path, tuple(sorted(r.methods))) for r in app.routes if hasattr(r, "methods")}
 check("GET /v1/models отдельно", ("/v1/models", ("GET",)) in routes)
-check("catch-all принимает GET и POST", ("/v1/{path:path}", ("GET",)) in routes
-      and ("/v1/{path:path}", ("POST",)) in routes, sorted(routes))
+check("catch-all только POST", ("/v1/{path:path}", ("POST",)) in routes
+      and ("/v1/{path:path}", ("GET",)) not in routes, sorted(routes))
 check("SAFE_PATH режет точки", not P.SAFE_PATH.fullmatch("../sleep"))
 check("SAFE_PATH пускает обычный путь", bool(P.SAFE_PATH.fullmatch("chat/completions")))
 srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)

@@ -42,7 +42,7 @@ def report() -> int:
 def one_model(**over) -> dict:
     """Конфиг с одной моделью на одном порту."""
     return {"internal_ports": [9000, 9100], "admin_port": 4999,
-            "models": {"m": {"cmd": "vllm serve X", "cwd": str(ROOT / "model"),
+            "models": {"m": {"script": str(SCRIPT), "cwd": str(ROOT / "model"),
                              "vram_gb": 10, "port": 8000}}, **over}
 
 

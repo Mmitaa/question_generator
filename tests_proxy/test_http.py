@@ -3,7 +3,7 @@ import asyncio
 import json
 import sys
 
-from fixture import ROOT, check, load, one_model, report
+from fixture import ROOT, SCRIPT, check, load, one_model, report
 import proxy as P
 import httpx
 import uvicorn
@@ -47,7 +47,7 @@ class Wired(P.Instance):
 async def main():
     global ok, fail
     settings = load(one_model(models={"m": {
-        "cmd": "x", "cwd": str(ROOT / "model"), "vram_gb": 1,
+        "script": str(SCRIPT), "cwd": str(ROOT / "model"), "vram_gb": 1,
         "port": 8100, "aliases": ["alias-m"]}}, internal_ports=[9500, 9600], admin_port=4998))
 
     server = uvicorn.Server(uvicorn.Config(fake, host="127.0.0.1", port=9599, log_level="error"))
@@ -69,18 +69,18 @@ async def main():
         r = await c.post("/v1/chat/completions?debug=1", json={"model": "alias-m", "hi": 1})
         check("POST дошёл", r.status_code == 200, r.text[:200])
         check("query проброшен в POST", seen["post"][1] == "debug=1", seen.get("post"))
-        check("алиас сохранён в теле", seen["post"][2]["model"] == "alias-m", seen.get("post"))
+        check("алиас переписан в каноническое имя (vLLM знает только его)",
+              seen["post"][2]["model"] == "m", seen.get("post"))
 
         r = await c.get("/v1/models")
         check("/v1/models отвечает прокси из конфига",
               {m["id"] for m in r.json()["data"]} == {"m", "alias-m"}, r.text[:200])
 
-        r = await c.get("/v1/some/thing?a=b")
-        check("GET проксируется", r.status_code == 200 and r.json()["path"] == "some/thing", r.text[:200])
-        check("query проброшен в GET", seen["get"][1] == "a=b", seen.get("get"))
 
-        r = await c.get("/v1/../sleep")
+        r = await c.post("/v1/../sleep", json={"model": "m"})
         check("обход по точкам не проходит", r.status_code == 404, f"{r.status_code} {r.text[:120]}")
+        r = await c.get("/v1/chat/completions")
+        check("GET к модели не проксируется", r.status_code == 405, r.status_code)
 
         got = []
         async with c.stream("POST", "/v1/chat/completions", json={"model": "m", "stream": True}) as r:
@@ -94,7 +94,7 @@ async def main():
         check("битый JSON от модели не роняет прокси", r.status_code == 200, r.text[:200])
 
         await asyncio.sleep(0.2)
-        inst = cluster.instances["m"][0]
+        inst = cluster.instances["m"]
         check("после всех запросов копия отпущена", inst.busy == 0, f"busy={inst.busy}")
 
     front.should_exit = server.should_exit = True

@@ -16,7 +16,7 @@ async def race(cl, sleeper_call):
 
     async def grab():
         await asyncio.sleep(0.01)
-        return cl.fastest("m")
+        return cl.ready("m")
 
     async with cl.gpus[0].lock:
         _, grabbed = await asyncio.gather(sleeper_call(cl, inst, cl.gpus[0]), grab())
@@ -83,18 +83,18 @@ async def main() -> int:
     cl = cluster(load(production()))
     await cl.preload()
     print(f"      {layout(cl)}")
-    awake = {n for n, g in cl.instances.items() if any(i.state is P.State.AWAKE for i in g)}
+    awake = {n for n, i in cl.instances.items() if i.state is P.State.AWAKE}
     check("активны ровно две модели, по одной на карту", len(awake) == 2, awake)
     check("приоритетная среди активных", "grade-ai" in awake, awake)
     check("остальные спят, а не остановлены",
-          len(cl.all_instances()) == 4 and all(i.state in (P.State.AWAKE, P.State.ASLEEP)
-                                               for i in cl.all_instances()))
+          len(cl.instances) == 4 and all(i.state in (P.State.AWAKE, P.State.ASLEEP)
+                                         for i in cl.instances.values()))
     switches = 0
     for _ in range(3):
         for name in ("grade-ai", "detector-14b"):
-            before = [i.state for i in cl.instances[name]]
+            before = cl.instances[name].state
             (await cl.acquire(name)).release()
-            switches += [i.state for i in cl.instances[name]] != before
+            switches += cl.instances[name].state != before
     check("чередование запросов почти не двигает модели", switches <= 1, f"{switches} переключений")
     return report()
 
